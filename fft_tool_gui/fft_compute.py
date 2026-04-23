@@ -36,10 +36,6 @@ def compute_fft_amplitude(
     if x.size < 2:
         raise ValueError("数据点数量不足，无法进行 FFT")
 
-    x = x - np.nanmean(x)
-    if np.any(~np.isfinite(x)):
-        raise ValueError("数据包含 NaN/Inf，无法计算 FFT")
-
     n = int(x.size)
     if nfft is None:
         nfft = next_pow2(n)
@@ -47,20 +43,24 @@ def compute_fft_amplitude(
     if nfft < 2:
         raise ValueError("NFFT 必须 >= 2")
 
+    n_used = min(n, nfft)
+    x = x[:n_used]
+    if np.any(~np.isfinite(x)):
+        raise ValueError("数据包含 NaN/Inf，无法计算 FFT")
+
     if window_enabled:
         if window_name.lower() == "kaiser":
             if window_param is None:
                 raise ValueError("Kaiser 窗需要 beta 参数")
-            w = signal.get_window(("kaiser", float(window_param)), n, fftbins=True)
+            w = signal.get_window(("kaiser", float(window_param)), n_used, fftbins=True)
         else:
-            w = signal.get_window(window_name, n, fftbins=True)
+            w = signal.get_window(window_name, n_used, fftbins=True)
         x = x * w
 
     y = np.fft.rfft(x, n=nfft)
-    amp = np.abs(y) / n
+    amp = np.abs(y) / n_used
     if amp.size > 2:
         amp[1:-1] *= 2.0
 
     f = np.fft.rfftfreq(nfft, d=1.0 / fs_hz)
     return FftResult(frequency_hz=f, amplitude=amp, nfft=nfft)
-

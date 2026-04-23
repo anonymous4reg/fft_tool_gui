@@ -21,10 +21,11 @@ class LoadWorker(QtCore.QObject):
     finished = QtCore.Signal(object, object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, path: Path, sheet_name: str | None):
+    def __init__(self, path: Path, sheet_name: str | None, csv_has_header: bool | None):
         super().__init__()
         self._path = path
         self._sheet_name = sheet_name
+        self._csv_has_header = csv_has_header
 
     @QtCore.Slot()
     def run(self) -> None:
@@ -32,7 +33,7 @@ class LoadWorker(QtCore.QObject):
             p = self._path
             suffix = p.suffix.lower()
             if suffix == ".csv":
-                loaded = load_csv(p)
+                loaded = load_csv(p, has_header=self._csv_has_header)
                 sheet_names = None
             elif suffix == ".xlsx":
                 sheet_names = get_xlsx_sheet_names(p)
@@ -59,7 +60,187 @@ class PlotState:
 
 
 class RightPanViewBox(pg.ViewBox):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._drag_start_range: tuple[list[float], list[float]] | None = None
+        self._drag_start_pos: QtCore.QPointF | None = None
+        self._drag_item: QtWidgets.QGraphicsItem | None = None
+        self._drag_mode: str | None = None
+
+    def _apply_left_drag_zoom(self, ev: Any) -> None:
+        if self._drag_start_range is None or self._drag_start_pos is None:
+            return
+
+        start_pos = self._drag_start_pos
+        end_pos = QtCore.QPointF(ev.pos())
+        dx = float(end_pos.x() - start_pos.x())
+        dy = float(end_pos.y() - start_pos.y())
+        if dx == 0.0 and dy == 0.0:
+            return
+
+        abs_dx = abs(dx)
+        abs_dy = abs(dy)
+        if abs_dx > abs_dy * 2.0:
+            axis_mode = "x"
+        elif abs_dy > abs_dx * 2.0:
+            axis_mode = "y"
+        else:
+            axis_mode = "xy"
+
+        zoom_out = dx < 0.0 and dy < 0.0
+
+        start_scene = self.mapToScene(start_pos)
+        end_scene = self.mapToScene(end_pos)
+        p1 = self.mapSceneToView(start_scene)
+        p2 = self.mapSceneToView(end_scene)
+        x1 = float(min(p1.x(), p2.x()))
+        x2 = float(max(p1.x(), p2.x()))
+        y1 = float(min(p1.y(), p2.y()))
+        y2 = float(max(p1.y(), p2.y()))
+
+        x0_range, y0_range = self._drag_start_range
+        x0_min, x0_max = float(x0_range[0]), float(x0_range[1])
+        y0_min, y0_max = float(y0_range[0]), float(y0_range[1])
+
+        center_pos = QtCore.QPointF((start_pos.x() + end_pos.x()) / 2.0, (start_pos.y() + end_pos.y()) / 2.0)
+        center_view = self.mapSceneToView(self.mapToScene(center_pos))
+        cx = float(center_view.x())
+        cy = float(center_view.y())
+
+        if zoom_out:
+            bounds = self.boundingRect()
+            view_w = float(bounds.width()) if bounds.width() else 1.0
+            view_h = float(bounds.height()) if bounds.height() else 1.0
+            box_w = max(1.0, abs_dx)
+            box_h = max(1.0, abs_dy)
+
+            if axis_mode in ("x", "xy"):
+                fx = max(1e-6, box_w / view_w)
+                new_w = (x0_max - x0_min) / fx
+                self.setXRange(cx - new_w / 2.0, cx + new_w / 2.0, padding=0.0)
+            else:
+                self.setXRange(x0_min, x0_max, padding=0.0)
+
+            if axis_mode in ("y", "xy"):
+                fy = max(1e-6, box_h / view_h)
+                new_h = (y0_max - y0_min) / fy
+                self.setYRange(cy - new_h / 2.0, cy + new_h / 2.0, padding=0.0)
+            else:
+                self.setYRange(y0_min, y0_max, padding=0.0)
+            return
+
+        if axis_mode in ("x", "xy"):
+            if x2 > x1:
+                self.setXRange(x1, x2, padding=0.0)
+        else:
+            self.setXRange(x0_min, x0_max, padding=0.0)
+
+        if axis_mode in ("y", "xy"):
+            if y2 > y1:
+                self.setYRange(y1, y2, padding=0.0)
+        else:
+            self.setYRange(y0_min, y0_max, padding=0.0)
+
+    def _clear_drag_feedback(self) -> None:
+        if self._drag_item is not None:
+            try:
+                if self._drag_item.scene() is not None:
+                    self._drag_item.scene().removeItem(self._drag_item)
+            except Exception:
+                pass
+        self._drag_item = None
+        self._drag_mode = None
+
+    def _ensure_drag_item(self, mode: str) -> None:
+        if self._drag_mode == mode and self._drag_item is not None:
+            return
+        self._clear_drag_feedback()
+        pen = pg.mkPen("#ffcc00", width=2)
+        if mode == "xy":
+            item = QtWidgets.QGraphicsRectItem()
+            item.setPen(pen)
+            item.setBrush(pg.mkBrush(255, 204, 0, 40))
+        else:
+            item = QtWidgets.QGraphicsPathItem()
+            item.setPen(pen)
+        item.setZValue(10_000)
+        item.setParentItem(self)
+        self._drag_item = item
+        self._drag_mode = mode
+
+    def _update_drag_feedback(self, ev: Any) -> None:
+        if self._drag_start_pos is None:
+            return
+        start_pos = self._drag_start_pos
+        end_pos = QtCore.QPointF(ev.pos())
+        dx = float(end_pos.x() - start_pos.x())
+        dy = float(end_pos.y() - start_pos.y())
+        abs_dx = abs(dx)
+        abs_dy = abs(dy)
+
+        if abs_dx < 2.0 and abs_dy < 2.0:
+            self._clear_drag_feedback()
+            return
+
+        if abs_dx > abs_dy * 2.0 and abs_dy <= 10.0:
+            mode = "x"
+        elif abs_dy > abs_dx * 2.0 and abs_dx <= 10.0:
+            mode = "y"
+        else:
+            mode = "xy"
+
+        self._ensure_drag_item(mode)
+        if self._drag_item is None:
+            return
+
+        x1 = float(min(start_pos.x(), end_pos.x()))
+        x2 = float(max(start_pos.x(), end_pos.x()))
+        y1 = float(min(start_pos.y(), end_pos.y()))
+        y2 = float(max(start_pos.y(), end_pos.y()))
+
+        if mode == "xy":
+            rect_item = self._drag_item  # type: ignore[assignment]
+            if isinstance(rect_item, QtWidgets.QGraphicsRectItem):
+                rect_item.setRect(QtCore.QRectF(x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)))
+            return
+
+        path_item = self._drag_item
+        if not isinstance(path_item, QtWidgets.QGraphicsPathItem):
+            return
+
+        path = QtGui.QPainterPath()
+        bar_len = 22.0
+        half = bar_len / 2.0
+        if mode == "x":
+            ymid = float((start_pos.y() + end_pos.y()) / 2.0)
+            path.moveTo(x1, ymid - half)
+            path.lineTo(x1, ymid + half)
+            path.moveTo(x2, ymid - half)
+            path.lineTo(x2, ymid + half)
+            path.moveTo(x1, ymid)
+            path.lineTo(x2, ymid)
+        else:
+            xmid = float((start_pos.x() + end_pos.x()) / 2.0)
+            path.moveTo(xmid - half, y1)
+            path.lineTo(xmid + half, y1)
+            path.moveTo(xmid - half, y2)
+            path.lineTo(xmid + half, y2)
+            path.moveTo(xmid, y1)
+            path.lineTo(xmid, y2)
+        path_item.setPath(path)
+
     def mouseDragEvent(self, ev: Any, axis: Any = None) -> None:
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            ev.accept()
+            if ev.isStart():
+                self._drag_start_range = self.viewRange()
+                self._drag_start_pos = QtCore.QPointF(ev.buttonDownPos())
+            self._update_drag_feedback(ev)
+            if ev.isFinish():
+                self._apply_left_drag_zoom(ev)
+                self._clear_drag_feedback()
+            return
+
         if ev.button() == QtCore.Qt.MouseButton.RightButton:
             ev.accept()
             if ev.isFinish():
@@ -76,6 +257,59 @@ class RightPanViewBox(pg.ViewBox):
             return
         super().mouseDragEvent(ev, axis=axis)
 
+    def wheelEvent(self, ev: Any, axis: Any = None) -> None:
+        delta: float | None = None
+        ev_delta = getattr(ev, "delta", None)
+        if ev_delta is not None:
+            try:
+                delta = float(ev_delta() if callable(ev_delta) else ev_delta)
+            except Exception:
+                delta = None
+        if delta is None:
+            try:
+                delta = float(ev.angleDelta().y())
+            except Exception:
+                delta = None
+        if delta is None:
+            super().wheelEvent(ev, axis=axis)
+            return
+
+        if delta == 0.0:
+            return
+
+        mods: Any = None
+        ev_mods = getattr(ev, "modifiers", None)
+        if ev_mods is not None and callable(ev_mods):
+            try:
+                mods = ev_mods()
+            except Exception:
+                mods = None
+        if mods is None:
+            mods = QtWidgets.QApplication.keyboardModifiers()
+        zoom_y_only = bool(mods & QtCore.Qt.ControlModifier)
+        zoom_x_only = bool(mods & (QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier))
+
+        steps = delta / 120.0
+        base = 0.98
+        scale = base**steps
+        if zoom_x_only or zoom_y_only:
+            sx = scale if zoom_x_only else 1.0
+            sy = scale if zoom_y_only else 1.0
+        else:
+            sx = scale
+            sy = scale
+
+        center = self.mapSceneToView(ev.scenePos())
+        self.scaleBy((sx, sy), center=center)
+        ev.accept()
+
+    def mouseClickEvent(self, ev: Any) -> None:
+        if ev.button() == QtCore.Qt.MouseButton.MiddleButton:
+            ev.accept()
+            self.enableAutoRange()
+            return
+        super().mouseClickEvent(ev)
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
@@ -83,13 +317,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("FFT Tool GUI")
 
         self._loaded: LoadedData | None = None
+        self._raw_df: pd.DataFrame | None = None
+        self._df: pd.DataFrame | None = None
+        self._use_transposed = False
         self._plot_state = PlotState()
         self._load_thread: QtCore.QThread | None = None
         self._load_worker: LoadWorker | None = None
         self._progress: QtWidgets.QProgressDialog | None = None
+        self._pending_time_autorange = False
+        self._updating_range_inputs = False
 
         self._build_ui()
         self._wire_events()
+
+    def _sync_param_enabled_states(self) -> None:
+        self.spn_nfft.setEnabled(not self.chk_auto_nfft.isChecked())
+        self.cbo_window.setEnabled(self.chk_window.isChecked())
+        self._update_window_param_enable()
+
+    def _cleanup_loader(self) -> None:
+        if self._load_thread is not None:
+            try:
+                self._load_thread.quit()
+                self._load_thread.wait(200)
+            except RuntimeError:
+                pass
+        self._load_thread = None
+        self._load_worker = None
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -112,12 +366,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_path.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.cbo_sheet = QtWidgets.QComboBox()
         self.cbo_sheet.setEnabled(False)
+        self.cbo_csv_header = QtWidgets.QComboBox()
+        self.cbo_csv_header.addItems(["自动识别", "有表头", "无表头"])
 
         file_layout.addWidget(self.btn_open, 0, 0, 1, 2)
         file_layout.addWidget(QtWidgets.QLabel("路径:"), 1, 0)
         file_layout.addWidget(self.lbl_path, 1, 1)
         file_layout.addWidget(QtWidgets.QLabel("Sheet:"), 2, 0)
         file_layout.addWidget(self.cbo_sheet, 2, 1)
+        file_layout.addWidget(QtWidgets.QLabel("CSV 表头:"), 3, 0)
+        file_layout.addWidget(self.cbo_csv_header, 3, 1)
 
         self.table = QtWidgets.QTableView()
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectItems)
@@ -129,26 +387,18 @@ class MainWindow(QtWidgets.QMainWindow):
         select_layout = QtWidgets.QGridLayout(select_group)
         left_layout.addWidget(select_group)
 
-        self.rdo_column = QtWidgets.QRadioButton("按列")
-        self.rdo_row = QtWidgets.QRadioButton("按行")
-        self.rdo_column.setChecked(True)
-
+        self.btn_transpose = QtWidgets.QPushButton("转置数据: 关")
+        self.btn_transpose.setCheckable(True)
+        self.btn_transpose.setEnabled(False)
         self.cbo_column = QtWidgets.QComboBox()
         self.cbo_time = QtWidgets.QComboBox()
         self.cbo_time.setEnabled(True)
-        self.spn_row = QtWidgets.QSpinBox()
-        self.spn_row.setMinimum(0)
-        self.spn_row.setMaximum(0)
-        self.spn_row.setEnabled(False)
 
-        select_layout.addWidget(self.rdo_column, 0, 0)
-        select_layout.addWidget(self.rdo_row, 0, 1)
-        select_layout.addWidget(QtWidgets.QLabel("列名:"), 1, 0)
-        select_layout.addWidget(self.cbo_column, 1, 1)
-        select_layout.addWidget(QtWidgets.QLabel("时间列:"), 2, 0)
-        select_layout.addWidget(self.cbo_time, 2, 1)
-        select_layout.addWidget(QtWidgets.QLabel("行号:"), 3, 0)
-        select_layout.addWidget(self.spn_row, 3, 1)
+        select_layout.addWidget(self.btn_transpose, 0, 0, 1, 2)
+        select_layout.addWidget(QtWidgets.QLabel("时间列:"), 1, 0)
+        select_layout.addWidget(self.cbo_time, 1, 1)
+        select_layout.addWidget(QtWidgets.QLabel("信号列:"), 2, 0)
+        select_layout.addWidget(self.cbo_column, 2, 1)
 
         self.spn_range_start = QtWidgets.QSpinBox()
         self.spn_range_start.setMinimum(0)
@@ -156,12 +406,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spn_range_end = QtWidgets.QSpinBox()
         self.spn_range_end.setMinimum(0)
         self.spn_range_end.setMaximum(0)
+        self.spn_range_len = QtWidgets.QSpinBox()
+        self.spn_range_len.setMinimum(1)
+        self.spn_range_len.setMaximum(1)
+        self.spn_range_len.setValue(1)
+        self.spn_range_len.setEnabled(False)
         self.btn_range_all = QtWidgets.QPushButton("全选范围")
 
-        select_layout.addWidget(QtWidgets.QLabel("范围起点:"), 4, 0)
-        select_layout.addWidget(self.spn_range_start, 4, 1)
-        select_layout.addWidget(QtWidgets.QLabel("范围终点:"), 5, 0)
-        select_layout.addWidget(self.spn_range_end, 5, 1)
+        select_layout.addWidget(QtWidgets.QLabel("信号范围起点:"), 3, 0)
+        select_layout.addWidget(self.spn_range_start, 3, 1)
+        select_layout.addWidget(QtWidgets.QLabel("信号范围终点:"), 4, 0)
+        select_layout.addWidget(self.spn_range_end, 4, 1)
+        select_layout.addWidget(QtWidgets.QLabel("信号长度L:"), 5, 0)
+        select_layout.addWidget(self.spn_range_len, 5, 1)
         select_layout.addWidget(self.btn_range_all, 6, 0, 1, 2)
 
         param_group = QtWidgets.QGroupBox("FFT 参数")
@@ -171,17 +428,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spn_fs = QtWidgets.QDoubleSpinBox()
         self.spn_fs.setMinimum(0.000001)
         self.spn_fs.setMaximum(1e12)
-        self.spn_fs.setDecimals(6)
-        self.spn_fs.setValue(1000.0)
+        self.spn_fs.setDecimals(2)
+        self.spn_fs.setValue(10000.0)
         self.spn_fs.setSuffix(" Hz")
 
         self.chk_auto_nfft = QtWidgets.QCheckBox("自动 NFFT(下一次幂)")
-        self.chk_auto_nfft.setChecked(True)
+        self.chk_auto_nfft.setChecked(False)
         self.spn_nfft = QtWidgets.QSpinBox()
         self.spn_nfft.setMinimum(2)
         self.spn_nfft.setMaximum(1_000_000_000)
-        self.spn_nfft.setValue(1024)
-        self.spn_nfft.setEnabled(False)
+        self.spn_nfft.setValue(10000)
+        self.spn_nfft.setEnabled(True)
 
         self.chk_window = QtWidgets.QCheckBox("加窗")
         self.cbo_window = QtWidgets.QComboBox()
@@ -199,7 +456,7 @@ class MainWindow(QtWidgets.QMainWindow):
         param_layout.addWidget(QtWidgets.QLabel("采样率 fs:"), 0, 0)
         param_layout.addWidget(self.spn_fs, 0, 1)
         param_layout.addWidget(self.chk_auto_nfft, 1, 0, 1, 2)
-        param_layout.addWidget(QtWidgets.QLabel("NFFT:"), 2, 0)
+        param_layout.addWidget(QtWidgets.QLabel("NFFT(FFT变换点数):"), 2, 0)
         param_layout.addWidget(self.spn_nfft, 2, 1)
         param_layout.addWidget(self.chk_window, 3, 0)
         param_layout.addWidget(self.cbo_window, 3, 1)
@@ -239,10 +496,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_pick.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         right_layout.addWidget(self.lbl_pick)
 
-        self._time_curve = self.time_plot.plot([], [], pen=pg.mkPen(160, 160, 160, width=1))
-        self._time_sel_curve = self.time_plot.plot([], [], pen=pg.mkPen(220, 0, 0, width=2))
+        self._time_curve = self.time_plot.plot([], [], pen=pg.mkPen("#1f77b4", width=1))
+        self._time_sel_curve = self.time_plot.plot([], [], pen=pg.mkPen("#d62728", width=2))
 
-        self._curve = self.fft_plot.plot([], [], pen=pg.mkPen(width=2))
+        self._curve = self.fft_plot.plot([], [], pen=pg.mkPen("#9467bd", width=2))
         self._marker = pg.ScatterPlotItem(size=10, pen=pg.mkPen(width=2), brush=pg.mkBrush(255, 255, 0, 180))
         self.fft_plot.addItem(self._marker)
 
@@ -257,18 +514,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _wire_events(self) -> None:
         self.btn_open.clicked.connect(self._on_open)
         self.cbo_sheet.currentIndexChanged.connect(self._on_sheet_changed)
+        self.cbo_csv_header.currentIndexChanged.connect(self._on_csv_header_changed)
         self.chk_auto_nfft.toggled.connect(self._on_auto_nfft_toggled)
         self.chk_window.toggled.connect(self._on_window_toggled)
         self.cbo_window.currentIndexChanged.connect(self._on_window_changed)
-        self.rdo_column.toggled.connect(self._on_signal_mode_changed)
+        self.btn_transpose.toggled.connect(self._on_transpose_toggled)
         self.btn_fft.clicked.connect(self._on_fft)
         self.btn_reset_view.clicked.connect(self._on_reset_view)
 
-        self.cbo_column.currentIndexChanged.connect(self._update_time_plot)
-        self.cbo_time.currentIndexChanged.connect(self._update_time_plot)
-        self.spn_row.valueChanged.connect(self._update_time_plot)
-        self.spn_range_start.valueChanged.connect(self._update_time_plot)
-        self.spn_range_end.valueChanged.connect(self._update_time_plot)
+        self.cbo_column.currentIndexChanged.connect(self._on_signal_column_changed)
+        self.cbo_time.currentIndexChanged.connect(self._on_time_column_changed)
+        self.spn_range_start.valueChanged.connect(self._on_range_start_changed)
+        self.spn_range_end.valueChanged.connect(self._on_range_end_changed)
+        self.spn_range_len.valueChanged.connect(self._on_range_len_changed)
         self.btn_range_all.clicked.connect(self._on_range_all)
 
         self.fft_plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
@@ -277,14 +535,14 @@ class MainWindow(QtWidgets.QMainWindow):
         widgets = [
             self.btn_open,
             self.cbo_sheet,
+            self.cbo_csv_header,
             self.table,
-            self.rdo_column,
-            self.rdo_row,
+            self.btn_transpose,
             self.cbo_column,
             self.cbo_time,
-            self.spn_row,
             self.spn_range_start,
             self.spn_range_end,
+            self.spn_range_len,
             self.btn_range_all,
             self.spn_fs,
             self.chk_auto_nfft,
@@ -310,8 +568,10 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             if self._progress is not None:
                 self._progress.hide()
+            self._sync_param_enabled_states()
 
     def _set_dataframe(self, df: pd.DataFrame) -> None:
+        self._df = df
         preview_df = df.head(PREVIEW_ROWS)
         model = DataFrameModel(preview_df)
         self.table.setModel(model)
@@ -339,13 +599,84 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cbo_time.setCurrentIndex(0)
         self.cbo_time.blockSignals(False)
 
-        if df.shape[0] > 0:
-            self.spn_row.setMaximum(max(0, int(df.shape[0] - 1)))
-        else:
-            self.spn_row.setMaximum(0)
-
         self._sync_range_controls()
+        self._pending_time_autorange = True
         self._update_time_plot()
+
+    def _apply_current_dataframe(self) -> None:
+        if self._raw_df is None:
+            self._df = None
+            self.btn_transpose.setEnabled(False)
+            return
+        df = self._raw_df.transpose() if self._use_transposed else self._raw_df
+        self.btn_transpose.setEnabled(True)
+        self.btn_transpose.blockSignals(True)
+        self.btn_transpose.setChecked(self._use_transposed)
+        self.btn_transpose.setText("转置数据: 开" if self._use_transposed else "转置数据: 关")
+        self.btn_transpose.blockSignals(False)
+        self._set_dataframe(df)
+
+    def _on_signal_column_changed(self, _index: int) -> None:
+        self._pending_time_autorange = True
+        self._update_time_plot()
+
+    def _on_time_column_changed(self, _index: int) -> None:
+        self._pending_time_autorange = True
+        self._update_time_plot()
+
+    def _update_range_len_from_range(self) -> None:
+        if self._df is None:
+            return
+        if self._updating_range_inputs:
+            return
+        self._updating_range_inputs = True
+        try:
+            start = int(self.spn_range_start.value())
+            end = int(self.spn_range_end.value())
+            if end < start:
+                end = start
+                self.spn_range_end.blockSignals(True)
+                self.spn_range_end.setValue(end)
+                self.spn_range_end.blockSignals(False)
+
+            length = max(1, end - start + 1)
+            self.spn_range_len.blockSignals(True)
+            self.spn_range_len.setValue(length)
+            self.spn_range_len.blockSignals(False)
+        finally:
+            self._updating_range_inputs = False
+
+    def _on_range_start_changed(self, _value: int) -> None:
+        self._update_range_len_from_range()
+        self._update_time_plot()
+
+    def _on_range_end_changed(self, _value: int) -> None:
+        self._update_range_len_from_range()
+        self._update_time_plot()
+
+    def _on_range_len_changed(self, _value: int) -> None:
+        if self._df is None:
+            return
+        if self._updating_range_inputs:
+            return
+        self._updating_range_inputs = True
+        try:
+            start = int(self.spn_range_start.value())
+            length = int(self.spn_range_len.value())
+            max_end = int(self.spn_range_end.maximum())
+            end = min(max_end, start + max(1, length) - 1)
+            self.spn_range_end.blockSignals(True)
+            self.spn_range_end.setValue(end)
+            self.spn_range_end.blockSignals(False)
+            self._update_range_len_from_range()
+        finally:
+            self._updating_range_inputs = False
+        self._update_time_plot()
+
+    def _on_transpose_toggled(self, checked: bool) -> None:
+        self._use_transposed = checked
+        self._pending_time_autorange = True
+        self._apply_current_dataframe()
 
     def _on_open(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -359,7 +690,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         p = Path(path)
         self.lbl_path.setText(str(p))
-        self._start_load(path=p, sheet_name=None)
+        self._start_load(path=p, sheet_name=None, csv_has_header=self._get_csv_has_header_setting())
 
     def _on_sheet_changed(self) -> None:
         if not self._loaded:
@@ -369,19 +700,30 @@ class MainWindow(QtWidgets.QMainWindow):
         sheet = self.cbo_sheet.currentText()
         if not sheet:
             return
-        self._start_load(path=self._loaded.path, sheet_name=sheet)
+        self._start_load(path=self._loaded.path, sheet_name=sheet, csv_has_header=self._get_csv_has_header_setting())
 
-    def _start_load(self, path: Path, sheet_name: str | None) -> None:
-        if self._load_thread is not None:
-            self._load_thread.quit()
-            self._load_thread.wait(200)
-            self._load_thread = None
-            self._load_worker = None
+    def _on_csv_header_changed(self) -> None:
+        if not self._loaded:
+            return
+        if self._loaded.path.suffix.lower() != ".csv":
+            return
+        self._start_load(path=self._loaded.path, sheet_name=None, csv_has_header=self._get_csv_has_header_setting())
+
+    def _get_csv_has_header_setting(self) -> bool | None:
+        idx = int(self.cbo_csv_header.currentIndex())
+        if idx == 1:
+            return True
+        if idx == 2:
+            return False
+        return None
+
+    def _start_load(self, path: Path, sheet_name: str | None, csv_has_header: bool | None) -> None:
+        self._cleanup_loader()
 
         self._set_loading(True, f"正在读取: {path.name}")
 
         thread = QtCore.QThread(self)
-        worker = LoadWorker(path=path, sheet_name=sheet_name)
+        worker = LoadWorker(path=path, sheet_name=sheet_name, csv_has_header=csv_has_header)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -399,6 +741,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_load_finished(self, loaded: object, sheet_names: object) -> None:
         try:
             self._loaded = loaded  # type: ignore[assignment]
+            self._raw_df = self._loaded.dataframe
             if sheet_names is None:
                 self.cbo_sheet.blockSignals(True)
                 self.cbo_sheet.clear()
@@ -416,13 +759,18 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.cbo_sheet.setCurrentIndex(idx)
                 self.cbo_sheet.blockSignals(False)
 
-            self._set_dataframe(self._loaded.dataframe)
+            self._apply_current_dataframe()
         finally:
+            self._cleanup_loader()
             self._set_loading(False)
 
     @QtCore.Slot(str)
     def _on_load_failed(self, message: str) -> None:
+        self._cleanup_loader()
         self._loaded = None
+        self._raw_df = None
+        self._df = None
+        self.btn_transpose.setEnabled(False)
         self._set_loading(False)
         QtWidgets.QMessageBox.critical(self, "导入失败", message)
 
@@ -439,14 +787,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_window_param_enable(self) -> None:
         enabled = self.chk_window.isChecked() and (self.cbo_window.currentText().lower() == "kaiser")
         self.spn_window_param.setEnabled(enabled)
-
-    def _on_signal_mode_changed(self) -> None:
-        by_col = self.rdo_column.isChecked()
-        self.cbo_column.setEnabled(by_col)
-        self.cbo_time.setEnabled(by_col)
-        self.spn_row.setEnabled(not by_col)
-        self._sync_range_controls()
-        self._update_time_plot()
 
     def _infer_time_column(self, df: pd.DataFrame) -> str | None:
         keywords = ("time", "timestamp", "t", "sec", "ms", "us", "ns")
@@ -473,63 +813,79 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError("时间列无法解析为有效时间")
         return (t_ns - np.nanmin(t_ns)) / 1e9
 
+    def _timedelta_like_series_to_seconds(self, s: pd.Series) -> np.ndarray:
+        td = pd.to_timedelta(s, errors="coerce")
+        td_np = td.to_numpy(dtype="timedelta64[ns]")
+        td_ns = td_np.astype("int64").astype(float)
+        td_ns[td.isna().to_numpy()] = np.nan
+        if not np.isfinite(td_ns).any():
+            raise ValueError("时间列无法解析为有效时间")
+        return (td_ns - np.nanmin(td_ns)) / 1e9
+
+    def _time_series_to_axis(self, s: pd.Series) -> tuple[np.ndarray, bool]:
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return self._datetime_like_series_to_seconds(s), True
+
+        x_num = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+        finite = x_num[np.isfinite(x_num)]
+        if finite.size and float(finite.size) / float(x_num.size) >= 0.9:
+            med = float(np.nanmedian(finite))
+            base = float(np.nanmin(finite))
+            if abs(med) >= 1e15:
+                return (x_num - base) / 1e9, True
+            if abs(med) >= 1e12:
+                return (x_num - base) / 1e3, True
+            if abs(med) >= 1e9:
+                return x_num - base, True
+            return x_num, False
+
+        parsed_td = pd.to_timedelta(s, errors="coerce")
+        if float(parsed_td.notna().mean()) >= 0.9:
+            return self._timedelta_like_series_to_seconds(s), True
+
+        parsed_dt = pd.to_datetime(s, errors="coerce")
+        if float(parsed_dt.notna().mean()) >= 0.9:
+            return self._datetime_like_series_to_seconds(s), True
+
+        raise ValueError("时间列无法解析为数值/时间戳/时长")
+
     def _get_time_axis_and_signal(self) -> tuple[np.ndarray, np.ndarray, bool]:
-        if not self._loaded:
+        if self._df is None:
             raise ValueError("请先导入数据")
-        df = self._loaded.dataframe
+        df = self._df
         if df.empty:
             raise ValueError("数据为空")
 
-        if self.rdo_column.isChecked():
-            col = self.cbo_column.currentText()
-            if not col:
-                raise ValueError("未选择列")
-            y_series = pd.to_numeric(df[col], errors="coerce")
-            y = y_series.to_numpy(dtype=float, na_value=np.nan)
+        col = self.cbo_column.currentText()
+        if not col:
+            raise ValueError("未选择列")
+        y_series = pd.to_numeric(df[col], errors="coerce")
+        y = y_series.to_numpy(dtype=float, na_value=np.nan)
 
-            time_name = self.cbo_time.currentText().strip()
-            if time_name and time_name != "无" and time_name in df.columns:
-                t_raw = df[time_name]
-                if pd.api.types.is_datetime64_any_dtype(t_raw):
-                    x = self._datetime_like_series_to_seconds(t_raw)
-                    is_seconds = True
-                else:
-                    parsed = pd.to_datetime(t_raw, errors="coerce")
-                    if float(parsed.notna().mean()) >= 0.9:
-                        x = self._datetime_like_series_to_seconds(t_raw)
-                        is_seconds = True
-                    else:
-                        x = pd.to_numeric(t_raw, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
-                        is_seconds = False
-            else:
+        time_name = self.cbo_time.currentText().strip()
+        if time_name and time_name != "无" and time_name in df.columns:
+            t_raw = df[time_name]
+            try:
+                x, is_seconds = self._time_series_to_axis(t_raw)
+            except Exception:
                 x = np.arange(y.size, dtype=float)
                 is_seconds = False
+        else:
+            x = np.arange(y.size, dtype=float)
+            is_seconds = False
 
-            mask = np.isfinite(x) & np.isfinite(y)
-            x = x[mask]
-            y = y[mask]
-            if y.size < 2:
-                raise ValueError("所选列的有效数值不足")
-            return x, y, is_seconds
-
-        row = int(self.spn_row.value())
-        row_values = df.iloc[row, :].to_numpy()
-        y_series = pd.to_numeric(pd.Series(row_values), errors="coerce").dropna()
-        y = y_series.to_numpy(dtype=float)
-        x = np.arange(y.size, dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x = x[mask]
+        y = y[mask]
         if y.size < 2:
-            raise ValueError("所选行的有效数值不足")
-        return x, y, False
+            raise ValueError("所选列的有效数值不足")
+        return x, y, is_seconds
 
     def _sync_range_controls(self) -> None:
-        if not self._loaded:
+        if self._df is None:
             n = 0
         else:
-            df = self._loaded.dataframe
-            if self.rdo_column.isChecked():
-                n = int(df.shape[0])
-            else:
-                n = int(df.shape[1])
+            n = int(self._df.shape[0])
 
         max_idx = max(0, n - 1)
         for spn in (self.spn_range_start, self.spn_range_end):
@@ -541,6 +897,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if n > 0 and self.spn_range_end.value() < self.spn_range_start.value():
             self.spn_range_end.setValue(self.spn_range_start.value())
+        self.spn_range_len.blockSignals(True)
+        if n <= 0:
+            self.spn_range_len.setEnabled(False)
+            self.spn_range_len.setMaximum(1)
+            self.spn_range_len.setValue(1)
+        else:
+            self.spn_range_len.setEnabled(True)
+            self.spn_range_len.setMaximum(n)
+            start = int(self.spn_range_start.value())
+            end = int(self.spn_range_end.value())
+            length = max(1, end - start + 1)
+            self.spn_range_len.setValue(min(n, length))
+        self.spn_range_len.blockSignals(False)
 
     def _get_selected_segment(self) -> tuple[np.ndarray, np.ndarray, bool]:
         x, y, is_seconds = self._get_time_axis_and_signal()
@@ -562,6 +931,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self.spn_range_start.setValue(0)
             self.spn_range_end.setValue(int(y.size - 1))
+            self._update_range_len_from_range()
         finally:
             self._update_time_plot()
 
@@ -574,8 +944,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            x, y, is_seconds = self._get_time_plot_series(max_points=PLOT_MAX_POINTS)
-            x_sel, y_sel, _ = self._get_time_plot_series(max_points=PLOT_MAX_POINTS, selected_only=True)
+            x, y, is_seconds, used_time_col = self._get_time_plot_series(max_points=PLOT_MAX_POINTS)
+            x_sel, y_sel, _, _ = self._get_time_plot_series(max_points=PLOT_MAX_POINTS, selected_only=True)
         except Exception:
             self._time_curve.setData([], [])
             self._time_sel_curve.setData([], [])
@@ -592,7 +962,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_range_controls()
         self._time_sel_curve.setData(x_sel, y_sel, connect="finite", autoDownsample=True, clipToView=True)
 
-        if self.rdo_column.isChecked() and self.cbo_time.currentText().strip() != "无":
+        if used_time_col:
             if is_seconds:
                 self.time_plot.setLabel("bottom", "Time", units="s")
             else:
@@ -600,83 +970,67 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.time_plot.setLabel("bottom", "Sample")
 
+        if self._pending_time_autorange:
+            self._pending_time_autorange = False
+            self.time_plot.enableAutoRange()
+
     def _get_time_plot_series(
         self,
         max_points: int,
         selected_only: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray, bool]:
-        if not self._loaded:
+    ) -> tuple[np.ndarray, np.ndarray, bool, bool]:
+        if self._df is None:
             raise ValueError("请先导入数据")
-        df = self._loaded.dataframe
+        df = self._df
         if df.empty:
             raise ValueError("数据为空")
 
-        if self.rdo_column.isChecked():
-            col = self.cbo_column.currentText()
-            if not col:
-                raise ValueError("未选择列")
-
-            if selected_only:
-                start = int(self.spn_range_start.value())
-                end = int(self.spn_range_end.value())
-                if end < start:
-                    start, end = end, start
-                start = max(0, min(start, int(df.shape[0] - 1)))
-                end = max(0, min(end, int(df.shape[0] - 1)))
-                data_slice = slice(start, end + 1)
-            else:
-                data_slice = slice(None)
-
-            y_raw = df[col].iloc[data_slice]
-            n = int(y_raw.shape[0])
-            step = max(1, int(np.ceil(n / max_points))) if max_points > 0 else 1
-            y_raw = y_raw.iloc[::step]
-            y = pd.to_numeric(y_raw, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
-
-            time_name = self.cbo_time.currentText().strip()
-            if time_name and time_name != "无" and time_name in df.columns:
-                t_raw = df[time_name].iloc[data_slice].iloc[::step]
-                if pd.api.types.is_datetime64_any_dtype(t_raw):
-                    x = self._datetime_like_series_to_seconds(t_raw)
-                    is_seconds = True
-                else:
-                    parsed = pd.to_datetime(t_raw, errors="coerce")
-                    if float(parsed.notna().mean()) >= 0.9:
-                        x = self._datetime_like_series_to_seconds(t_raw)
-                        is_seconds = True
-                    else:
-                        x = pd.to_numeric(t_raw, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
-                        is_seconds = False
-            else:
-                if selected_only:
-                    x = np.arange(int(self.spn_range_start.value()), int(self.spn_range_end.value()) + 1, step, dtype=float)
-                else:
-                    x = np.arange(0, n, step, dtype=float)
-                is_seconds = False
-
-            mask = np.isfinite(x) & np.isfinite(y)
-            return x[mask], y[mask], is_seconds
-
-        row = int(self.spn_row.value())
-        row_values = df.iloc[row, :]
-        n = int(row_values.shape[0])
         if selected_only:
             start = int(self.spn_range_start.value())
             end = int(self.spn_range_end.value())
             if end < start:
                 start, end = end, start
-            start = max(0, min(start, n - 1))
-            end = max(0, min(end, n - 1))
-            idx = np.arange(start, end + 1, dtype=int)
+            start = max(0, min(start, int(df.shape[0] - 1)))
+            end = max(0, min(end, int(df.shape[0] - 1)))
+            data_slice = slice(start, end + 1)
         else:
-            idx = np.arange(0, n, dtype=int)
+            data_slice = slice(None)
 
-        step = max(1, int(np.ceil(idx.size / max_points))) if max_points > 0 else 1
-        idx = idx[::step]
-        y = pd.to_numeric(row_values.iloc[idx], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
-        x = idx.astype(float)
-        mask = np.isfinite(y)
-        return x[mask], y[mask], False
+        col = self.cbo_column.currentText()
+        if not col:
+            raise ValueError("未选择列")
+        y_raw = df[col].iloc[data_slice]
+        n = int(y_raw.shape[0])
+        step = max(1, int(np.ceil(n / max_points))) if max_points > 0 else 1
+        y_raw = y_raw.iloc[::step]
+        y = pd.to_numeric(y_raw, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+
+        if selected_only:
+            sample_x = np.arange(int(self.spn_range_start.value()), int(self.spn_range_end.value()) + 1, step, dtype=float)
+        else:
+            sample_x = np.arange(0, n, step, dtype=float)
+
+        time_name = self.cbo_time.currentText().strip()
+        if time_name and time_name != "无" and time_name in df.columns:
+            t_raw = df[time_name].iloc[data_slice].iloc[::step]
+            used_time_col = True
+            try:
+                x, is_seconds = self._time_series_to_axis(t_raw)
+            except Exception:
+                x = sample_x
+                is_seconds = False
+                used_time_col = False
+                self.statusBar().showMessage("时间列解析失败，已回退到采样点作为横轴", 5000)
+        else:
+            x = sample_x
+            is_seconds = False
+            used_time_col = False
+
+        mask = np.isfinite(x) & np.isfinite(y)
+        if int(mask.sum()) < 2 and used_time_col:
+            y_mask = np.isfinite(y)
+            return sample_x[y_mask], y[y_mask], False, False
+        return x[mask], y[mask], is_seconds, used_time_col
 
     def _on_fft(self) -> None:
         try:
@@ -711,9 +1065,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "FFT 失败", str(e))
 
     def _get_selected_y_for_fft(self) -> np.ndarray:
-        if not self._loaded:
+        if self._df is None:
             raise ValueError("请先导入数据")
-        df = self._loaded.dataframe
+        df = self._df
         if df.empty:
             raise ValueError("数据为空")
 
@@ -723,21 +1077,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if end < start:
             start, end = end, start
 
-        if self.rdo_column.isChecked():
-            col = self.cbo_column.currentText()
-            if not col:
-                raise ValueError("未选择列")
-            start = max(0, min(start, int(df.shape[0] - 1)))
-            end = max(0, min(end, int(df.shape[0] - 1)))
-            y_raw = df[col].iloc[start : end + 1]
-            y = pd.to_numeric(y_raw, errors="coerce").dropna().to_numpy(dtype=float)
-        else:
-            row = int(self.spn_row.value())
-            row_values = df.iloc[row, :]
-            n = int(row_values.shape[0])
-            start = max(0, min(start, n - 1))
-            end = max(0, min(end, n - 1))
-            y = pd.to_numeric(row_values.iloc[start : end + 1], errors="coerce").dropna().to_numpy(dtype=float)
+        col = self.cbo_column.currentText()
+        if not col:
+            raise ValueError("未选择列")
+        start = max(0, min(start, int(df.shape[0] - 1)))
+        end = max(0, min(end, int(df.shape[0] - 1)))
+        y_raw = df[col].iloc[start : end + 1]
+        y = pd.to_numeric(y_raw, errors="coerce").dropna().to_numpy(dtype=float)
 
         if y.size < 2:
             raise ValueError("所选范围的有效数值不足")
